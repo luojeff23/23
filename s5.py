@@ -7,40 +7,17 @@ from time import time
 from datetime import datetime
 from urllib.parse import urlparse
 import argparse
-import ipaddress # For IP validation
-import signal # 导入signal模块，用于处理信号
+import ipaddress
+import signal
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "socks5_tester_config.json")
+# 直接在脚本中定义配置，不再使用外部配置文件
 DEFAULT_TEST_URL = "https://api.ipify.org"
 DEFAULT_CONCURRENCY = 10
 DEFAULT_TIMEOUT = 5
 
-def load_config():
-    try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            config_data = json.load(f)
-            # Ensure all keys exist and have correct types
-            config_data['test_url'] = str(config_data.get('test_url', DEFAULT_TEST_URL))
-            config_data['concurrency'] = int(config_data.get('concurrency', DEFAULT_CONCURRENCY))
-            config_data['timeout'] = int(config_data.get('timeout', DEFAULT_TIMEOUT))
-            if config_data['concurrency'] <= 0:
-                config_data['concurrency'] = DEFAULT_CONCURRENCY
-            if config_data['timeout'] <= 0:
-                config_data['timeout'] = DEFAULT_TIMEOUT
-            return config_data
-    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
-        return {
-            'test_url': DEFAULT_TEST_URL,
-            'concurrency': DEFAULT_CONCURRENCY,
-            'timeout': DEFAULT_TIMEOUT
-        }
-
-def save_config(config_data):
-    try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config_data, f, indent=4)
-    except IOError:
-        print(f"警告: 无法保存配置文件到 {CONFIG_FILE}")
+# 弱密码测试用的用户名和密码列表
+USERNAME_LIST = ['admin', '123456', '123', 'socks5', '12345678', '111']
+PASSWORD_LIST = ['admin', '123456', '123', 'socks5', '12345678', '111']
 
 def parse_proxy(line):
     line = line.strip()
@@ -53,10 +30,12 @@ def parse_proxy(line):
             if ':' in auth:
                 user, pwd = auth.split(':', 1)
                 return {'ip': ip, 'port': port, 'user': user, 'pwd': pwd}
-    else:
-        if ':' in line:
-            ip, port = line.split(':', 1)
-            return {'ip': ip, 'port': port, 'user': None, 'pwd': None}
+    elif ',' in line and line.count(',') == 1:
+        ip, port = line.split(',', 1)
+        return {'ip': ip.strip(), 'port': port.strip(), 'user': None, 'pwd': None}
+    elif ':' in line:
+        ip, port = line.split(':', 1)
+        return {'ip': ip, 'port': port, 'user': None, 'pwd': None}
     return None
 
 def format_proxy(proxy):
@@ -66,6 +45,7 @@ def format_proxy(proxy):
         return f"socks5://{proxy['ip']}:{proxy['port']}"
 
 def test_proxy(proxy, test_url, timeout):
+    """无密码测试SOCKS5代理"""
     ip, port = proxy['ip'], proxy['port']
     user, pwd = proxy['user'], proxy['pwd']
 
@@ -75,32 +55,231 @@ def test_proxy(proxy, test_url, timeout):
         proxy_specifier = f"socks5://{ip}:{port}"
 
     cmd = [
-        "curl", "--silent", "--output", os.devnull, "--write-out", "%{http_code}",
-        "--connect-timeout", str(timeout), "--max-time", str(timeout),
-        "-x", proxy_specifier, test_url
+        "curl", 
+        "--connect-timeout", str(timeout), 
+        "--max-time", str(timeout),
+        "-x", proxy_specifier, 
+        test_url
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        code = result.stdout.strip()
-        return code.isdigit() and 200 <= int(code) < 400
+        # 不使用--silent和--output os.devnull，让curl返回实际内容
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2, 
+                               creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        response_content = result.stdout.strip()
+        
+        # 检查响应内容是否非空，表示代理可用
+        return result.returncode == 0 and len(response_content) > 0
     except subprocess.TimeoutExpired:
-        return False # Curl command itself timed out
+        return False
     except Exception:
         return False
 
-def save_working_proxies(ok_list, filename="vs5.txt"):
-    """保存可用代理到指定文件"""
+def test_proxy_with_credentials(proxy, username, password, test_url, timeout):
+    """
+    使用用户名和密码测试SOCKS5代理
+    """
+    ip, port = proxy['ip'], proxy['port']
+    proxy_specifier = f"socks5://{username}:{password}@{ip}:{port}"
+
+    cmd = [
+        "curl", 
+        "--connect-timeout", str(timeout), 
+        "--max-time", str(timeout),
+        "-x", proxy_specifier, 
+        test_url
+    ]
     try:
-        with open(filename, "w", encoding="utf-8") as f_out:
+        # 不使用--silent和--output os.devnull，让curl返回实际内容
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2, 
+                               creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        response_content = result.stdout.strip()
+        
+        # 检查响应内容是否非空，表示代理可用
+        is_valid = result.returncode == 0 and len(response_content) > 0
+        
+        # 调试信息：如果失败了，但返回码是0，打印响应内容帮助诊断
+        if not is_valid and result.returncode == 0:
+            print(f"\n调试信息 - 返回码: {result.returncode}, 内容: '{response_content}'")
+        
+        return is_valid
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception as e:
+        # 提供更详细的错误信息
+        print(f"\n调试信息 - 测试失败: {str(e)}")
+        return False
+
+def save_working_proxies(ok_list, input_filename):
+    """保存可用代理到指定文件"""
+    # 获取输入文件的目录
+    input_dir = os.path.dirname(os.path.abspath(input_filename))
+    # 从输入文件名生成输出文件名
+    base_name = os.path.basename(input_filename)
+    name_without_ext, ext = os.path.splitext(base_name)
+    # 在同一目录下创建输出文件
+    output_filename = os.path.join(input_dir, f"{name_without_ext}_valid{ext}")
+    
+    try:
+        with open(output_filename, "w", encoding="utf-8") as f_out:
             for p_ok in ok_list:
                 f_out.write(format_proxy(p_ok) + "\n")
-        print(f"\n可用代理已保存到 {filename}")
+        print(f"\n可用代理已保存到 {output_filename}")
     except IOError:
-        print(f"\n错误: 无法写入可用代理文件到 {filename}")
+        print(f"\n错误: 无法写入可用代理文件到 {output_filename}")
 
-def main(proxy_file_arg): # proxy_file_arg 可以是来自命令行的路径，或者 None
+def weak_password_test(file_to_use_for_testing, config, signal_handler, original_sigint_handler):
+    """弱密码批量测试函数"""
+    global interrupted
+    interrupted = False
+    
+    # 设置信号处理
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    try:
+        with open(file_to_use_for_testing, encoding='utf-8') as f:
+            lines = f.readlines()
+        proxies = [parse_proxy(line) for line in lines]
+        proxies = [p for p in proxies if p]
+        total = len(proxies)
+        if total == 0:
+            print("没有从文件中解析到有效代理。")
+            return
+            
+        print(f"共{total}个代理，使用测试网址 {config['test_url']}, 并发数 {config['concurrency']}, 超时 {config['timeout']}s.")
+        print("开始弱密码检测...")
+        
+        # 扩展用户名和密码列表，增加常见组合
+        if 'admin' not in USERNAME_LIST:
+            USERNAME_LIST.append('admin')
+        if 'admin' not in PASSWORD_LIST:
+            PASSWORD_LIST.append('admin')
+        
+        ok_list = []
+        done_count = 0
+        start_time = time()
+
+        # 对每个代理进行弱密码测试
+        for proxy in proxies:
+            if interrupted:
+                break
+                
+            print(f"\n测试代理 {proxy['ip']}:{proxy['port']}")
+            found_valid_creds = False
+            
+            # 计算测试凭证总数
+            same_index_count = min(len(USERNAME_LIST), len(PASSWORD_LIST))
+            # 计算不重复的实际组合总数
+            unique_combinations = len(USERNAME_LIST) * len(PASSWORD_LIST) - len(set(USERNAME_LIST) & set(PASSWORD_LIST))
+            total_combinations = unique_combinations + len(set(USERNAME_LIST) & set(PASSWORD_LIST))
+            creds_count = 0
+            
+            # 创建已测试的凭证集合，避免重复测试
+            tested_creds = set()
+            
+            # 先测试用户名密码相同的组合 (如admin:admin, root:root)
+            print("\n先测试用户名密码相同的组合...")
+            for username in USERNAME_LIST:
+                if username in PASSWORD_LIST and username not in tested_creds:
+                    if interrupted or found_valid_creds:
+                        break
+                    
+                    password = username
+                    cred_key = f"{username}:{password}"
+                    tested_creds.add(cred_key)
+                    
+                    creds_count += 1
+                    print(f"\r尝试凭证 [{creds_count}/{total_combinations}] {username}:{password}\033[K", end="")
+                    
+                    is_ok = test_proxy_with_credentials(proxy, username, password, config['test_url'], config['timeout'])
+                    if is_ok:
+                        # 设置可用凭证
+                        proxy['user'] = username
+                        proxy['pwd'] = password
+                        found_valid_creds = True
+                        ok_list.append(proxy.copy())  # 使用copy避免后续修改影响已保存的数据
+                        print(f"\r尝试凭证 [{creds_count}/{total_combinations}] {username}:{password} - 可用 \033[32m√\033[0m\033[K")
+                        break
+            
+            # 然后测试所有其他组合（避免重复）
+            if not found_valid_creds and not interrupted:
+                print("\n测试所有其他账号密码组合...")
+                for username in USERNAME_LIST:
+                    if interrupted or found_valid_creds:
+                        break
+                        
+                    for password in PASSWORD_LIST:
+                        if interrupted:
+                            break
+                        
+                        # 跳过已测试的凭证
+                        cred_key = f"{username}:{password}"
+                        if cred_key in tested_creds:
+                            continue
+                            
+                        tested_creds.add(cred_key)
+                        creds_count += 1
+                        
+                        print(f"\r尝试凭证 [{creds_count}/{total_combinations}] {username}:{password}\033[K", end="")
+                        
+                        is_ok = test_proxy_with_credentials(proxy, username, password, config['test_url'], config['timeout'])
+                        if is_ok:
+                            # 设置可用凭证
+                            proxy['user'] = username
+                            proxy['pwd'] = password
+                            found_valid_creds = True
+                            ok_list.append(proxy.copy())  # 使用copy避免后续修改影响已保存的数据
+                            print(f"\r尝试凭证 [{creds_count}/{total_combinations}] {username}:{password} - 可用 \033[32m√\033[0m\033[K")
+                            break
+            
+            if not found_valid_creds and not interrupted:
+                print(f"\r尝试所有凭证 [{creds_count}/{total_combinations}] - 未找到可用凭证\033[K")
+            
+            done_count += 1
+            print(f"\n进度: [{done_count}/{total}] 代理")
+        
+        # 处理结果
+        if not interrupted:
+            print(f"\n检测完成, 可用代理{len(ok_list)}个, 用时{int(time()-start_time)}秒")
+            if ok_list:
+                save_working_proxies(ok_list, file_to_use_for_testing)
+        else:
+            print(f"已测试: {done_count}/{total}, 找到可用代理: {len(ok_list)}个, 用时{int(time()-start_time)}秒")
+            if ok_list:
+                save_working_proxies(ok_list, file_to_use_for_testing)
+                
+    except Exception as e:
+        print(f"\n发生错误: {e}")
+    
+    finally:
+        # 恢复原始信号处理
+        signal.signal(signal.SIGINT, original_sigint_handler)
+        
+        # 如果是因为中断而结束的
+        if interrupted:
+            # 询问是否返回主菜单或退出程序
+            while True:
+                try:
+                    choice = input("\n是否返回主菜单? (y/n): ").strip().lower()
+                    if choice == 'n':
+                        print("退出程序。")
+                        sys.exit(0)
+                    elif choice == 'y':
+                        break
+                    else:
+                        print("请输入 y 或 n")
+                except KeyboardInterrupt:
+                    print("\n退出程序。")
+                    sys.exit(0)
+
+def main(proxy_file_arg):
     print("SOCKS5代理批量检测工具")
-    config = load_config()
+    
+    # 使用内存中的配置，不再从文件加载
+    config = {
+        'test_url': DEFAULT_TEST_URL,
+        'concurrency': DEFAULT_CONCURRENCY,
+        'timeout': DEFAULT_TIMEOUT
+    }
     
     # 全局变量用于标记中断状态
     global interrupted
@@ -128,11 +307,12 @@ def main(proxy_file_arg): # proxy_file_arg 可以是来自命令行的路径，�
         print(f"  并发数: {config['concurrency']}")
         print(f"  超时时间 (秒): {config['timeout']}")
         print("\n菜单选项:")
-        print("  1. 开始检测")
-        print("  2. 修改测试网址")
-        print("  3. 修改并发数")
-        print("  4. 修改超时时间")
-        print("  5. 退出")
+        print("  1. 开始s5无密码检测")
+        print("  2. 开始s5弱密码检测")
+        print("  3. 修改测试网址")
+        print("  4. 修改并发数")
+        print("  5. 修改超时时间")
+        print("  0. 退出")
 
         choice = input("请输入选项: ").strip()
 
@@ -166,9 +346,8 @@ def main(proxy_file_arg): # proxy_file_arg 可以是来自命令行的路径，�
                 print("没有从文件中解析到有效代理。")
                 continue
 
-            print(f"共{total}个代理，使用测试网址 {config['test_url']}, 并发数 {config['concurrency']}, 超时 {config['timeout']}s.")
+            print(f"共{total}个代理，使用测试网址 {config['test_url']}, 并发数 {config['concurrency']}, 超时 {config['timeout']}s。")
             print("开始检测...")
-            print("按 Ctrl+C 可中断测试并保存已测试成功的代理")
 
             ok_list = []
             done_count = 0
@@ -222,10 +401,7 @@ def main(proxy_file_arg): # proxy_file_arg 可以是来自命令行的路径，�
                 if not interrupted:
                     print(f"\n检测完成, 可用代理{len(ok_list)}个, 用时{int(time()-start_time)}秒")
                     if ok_list:
-                        outname = f"working_proxies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                        save_working_proxies(ok_list, outname)
-                        # 同时也保存到vs5.txt
-                        save_working_proxies(ok_list, "vs5.txt")
+                        save_working_proxies(ok_list, file_to_use_for_testing)
 
             except Exception as e:
                 print(f"\n发生错误: {e}")
@@ -238,9 +414,9 @@ def main(proxy_file_arg): # proxy_file_arg 可以是来自命令行的路径，�
                 if interrupted:
                     print(f"已测试: {done_count}/{total}, 找到可用代理: {len(ok_list)}个, 用时{int(time()-start_time)}秒")
                     
-                    # 保存已测试成功的代理到vs5.txt
+                    # 保存已测试成功的代理
                     if ok_list:
-                        save_working_proxies(ok_list, "vs5.txt")
+                        save_working_proxies(ok_list, file_to_use_for_testing)
                     
                     # 询问是否返回主菜单或退出程序
                     while True:
@@ -258,21 +434,41 @@ def main(proxy_file_arg): # proxy_file_arg 可以是来自命令行的路径，�
                             sys.exit(0)
 
         elif choice == '2':
+            # 弱密码检测功能
+            file_to_use_for_testing = proxy_file_arg # 优先使用命令行参数
+
+            if file_to_use_for_testing is None:
+                # 如果没有通过命令行提供文件，则提示用户输入
+                file_to_use_for_testing = input("请输入代理文件路径: ").strip()
+                if not file_to_use_for_testing: # 用户没有输入任何内容
+                    print("错误: 未输入代理文件路径。操作已取消。")
+                    continue # 返回主菜单
+            else:
+                # 如果通过命令行提供了文件，打印提示信息
+                print(f"信息: 将使用命令行提供的代理文件 '{file_to_use_for_testing}' 进行检测。")
+
+            # 检查文件是否存在 (无论是来自命令行还是用户输入)
+            if not os.path.isfile(file_to_use_for_testing):
+                print(f"错误: 代理文件 '{file_to_use_for_testing}' 不存在或路径无效。")
+                continue # 返回主菜单
+                
+            # 开始弱密码测试
+            weak_password_test(file_to_use_for_testing, config, signal_handler, original_sigint_handler)
+
+        elif choice == '3':
             new_url = input(f"请输入新的测试网址 (当前: {config['test_url']}): ").strip()
             if new_url:
                 config['test_url'] = new_url
-                save_config(config)
                 print("测试网址已更新。")
             else:
                 print("输入为空, 未作修改。")
-        elif choice == '3':
+        elif choice == '4':
             new_concurrency_str = input(f"请输入新的并发数 (当前: {config['concurrency']}): ").strip()
             if new_concurrency_str:
                 try:
                     new_concurrency = int(new_concurrency_str)
                     if new_concurrency > 0:
                         config['concurrency'] = new_concurrency
-                        save_config(config)
                         print("并发数已更新。")
                     else:
                         print("并发数必须为正整数。")
@@ -280,14 +476,13 @@ def main(proxy_file_arg): # proxy_file_arg 可以是来自命令行的路径，�
                     print("无效输入，并发数需为整数。")
             else:
                 print("输入为空, 未作修改。")
-        elif choice == '4':
+        elif choice == '5':
             new_timeout_str = input(f"请输入新的超时时间 (秒) (当前: {config['timeout']}): ").strip()
             if new_timeout_str:
                 try:
                     new_timeout = int(new_timeout_str)
                     if new_timeout > 0:
                         config['timeout'] = new_timeout
-                        save_config(config)
                         print("超时时间已更新。")
                     else:
                         print("超时时间必须为正整数。")
@@ -295,7 +490,7 @@ def main(proxy_file_arg): # proxy_file_arg 可以是来自命令行的路径，�
                     print("无效输入，超时时间需为整数。")
             else:
                 print("输入为空, 未作修改。")
-        elif choice == '5':
+        elif choice == '0':
             print("退出程序。")
             sys.exit(0)
         else:
