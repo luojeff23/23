@@ -27,20 +27,75 @@ def parse_proxy(line):
     line = line.strip()
     if not line or line.startswith('#'):
         return None
+
+    # Try Format 1: ip:port|user:pwd
     if '|' in line:
-        addr, auth = line.split('|', 1)
-        if ':' in addr:
-            ip, port = addr.split(':', 1)
-            if ':' in auth:
-                user, pwd = auth.split(':', 1)
-                return {'ip': ip, 'port': port, 'user': user, 'pwd': pwd}
-    elif ',' in line and line.count(',') == 1:
-        ip, port = line.split(',', 1)
-        return {'ip': ip.strip(), 'port': port.strip(), 'user': None, 'pwd': None}
-    elif ':' in line:
-        ip, port = line.split(':', 1)
-        return {'ip': ip, 'port': port, 'user': None, 'pwd': None}
-    return None
+        try:
+            addr_part, auth_part = line.split('|', 1)
+            ip_str, port_str = addr_part.split(':', 1)
+            user_str, pwd_str = auth_part.split(':', 1)
+            
+            ip_str = ip_str.strip()
+            port_str = port_str.strip()
+            user_str = user_str.strip()
+            pwd_str = pwd_str.strip()
+
+            if port_str.isdigit():
+                ipaddress.ip_address(ip_str) # Validate IP
+                return {'ip': ip_str, 'port': port_str, 'user': user_str, 'pwd': pwd_str}
+        except ValueError: # Handles errors from split, strip, isdigit, or ip_address
+            pass # Malformed or invalid IP/port, try other formats
+
+    # Try Format 2: CSV with IP in 2nd column, Port in 3rd (e.g., FOFA output)
+    # Example: host,ip,port,...
+    # User's KR.csv header: 主机,IP,端口,...
+    if ',' in line: # Check if comma exists
+        parts = [p.strip() for p in line.split(',')]
+        
+        # Handle FOFA-like CSV (IP in 2nd col, Port in 3rd col)
+        if len(parts) >= 3:
+            # Skip typical CSV header lines (case-insensitive check)
+            # Check for user's specific header: 主机,IP,端口 (from KR.csv)
+            if parts[0].lower() == '主机' and parts[1].lower() == 'ip' and parts[2].lower() == '端口':
+                 return None
+            # Generic check for headers like "some_host_col_name,ip,port,..." or "...,ip,端口,..."
+            if parts[1].lower() == 'ip' and (parts[2].lower() == 'port' or parts[2].lower() == '端口'):
+                 return None
+
+            ip_str = parts[1]
+            port_str = parts[2]
+
+            if port_str.isdigit():
+                try:
+                    ipaddress.ip_address(ip_str) # Validate IP format
+                    return {'ip': ip_str, 'port': port_str, 'user': None, 'pwd': None}
+                except ValueError:
+                    # This might not be the FOFA format, or IP is invalid.
+                    # It could be the simpler "ip,port" format if line.count(',') == 1.
+                    pass 
+        
+        # Try Format 3: ip,port (exactly one comma, resulting in 2 parts)
+        if line.count(',') == 1: 
+            try:
+                ip_str_simple, port_str_simple = [p.strip() for p in line.split(',', 1)]
+                if port_str_simple.isdigit():
+                    ipaddress.ip_address(ip_str_simple) # Validate IP
+                    return {'ip': ip_str_simple, 'port': port_str_simple, 'user': None, 'pwd': None}
+            except ValueError:
+                pass # Malformed or not ip,port
+
+    # Try Format 4: ip:port (no auth, no comma, no pipe)
+    if ':' in line and '|' not in line and ',' not in line:
+        try:
+            ip_str, port_str = [p.strip() for p in line.split(':', 1)]
+            # Ensure not misinterpreting user:pwd@ip as ip and port is digit
+            if '@' not in ip_str and port_str.isdigit():
+                ipaddress.ip_address(ip_str) # Validate IP
+                return {'ip': ip_str, 'port': port_str, 'user': None, 'pwd': None}
+        except ValueError:
+            pass # Malformed or not ip:port
+
+    return None # If none of the formats match
 
 def format_proxy(proxy):
     if proxy['user'] and proxy['pwd']:
@@ -97,9 +152,9 @@ def save_working_proxies(ok_list, input_filename):
     input_dir = os.path.dirname(os.path.abspath(input_filename))
     # 从输入文件名生成输出文件名
     base_name = os.path.basename(input_filename)
-    name_without_ext, ext = os.path.splitext(base_name)
-    # 在同一目录下创建输出文件
-    output_filename = os.path.join(input_dir, f"{name_without_ext}_valid{ext}")
+    name_without_ext, _ = os.path.splitext(base_name)
+    # 在同一目录下创建输出文件，并固定扩展名为 .txt
+    output_filename = os.path.join(input_dir, f"{name_without_ext}_valid.txt")
     
     try:
         with open(output_filename, "w", encoding="utf-8") as f_out:
